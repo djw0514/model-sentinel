@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "name": "core-reasoning-smoke",
+  "version": "1.0.0",
+  "description": "Short, deterministic probes ordered for early stopping. No current-events knowledge.",
+  "cases": [
+    {
+      "id": "arith-01",
+      "category": "arithmetic",
+      "prompt": "Compute (37*14)-29. Reply with the integer.",
+      "grader": { "type": "exact", "answers": ["489"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "logic-01",
+      "category": "logic",
+      "prompt": "All glims are tors. No tors are veks. Can any glim be a vek? yes/no",
+      "grader": { "type": "exact", "answers": ["no"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-01",
+      "category": "code",
+      "prompt": "Python output? a=[1,2]; b=a; b += [3]; print(len(a))",
+      "grader": { "type": "exact", "answers": ["3"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-01",
+      "category": "instruction",
+      "prompt": "Take letters at odd 1-based positions of PLANETS.",
+      "grader": { "type": "exact", "answers": ["PAES"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-02",
+      "category": "arithmetic",
+      "prompt": "Evaluate (84/7)+(5*9)-8. Reply with the integer.",
+      "grader": { "type": "exact", "answers": ["49"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "struct-01",
+      "category": "structured",
+      "prompt": "From 'y=blue;x=7', return JSON with keys x then y; x is a number.",
+      "grader": { "type": "json", "value": { "x": 7, "y": "blue" } },
+      "max_tokens": 16
+    },
+    {
+      "id": "logic-02",
+      "category": "logic",
+      "prompt": "Lia is older than Mo. Mo is older than Nia. Who is youngest?",
+      "grader": { "type": "exact", "answers": ["Nia"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-02",
+      "category": "code",
+      "prompt": "JavaScript output? let x=3; x*=2; x+=1; console.log(x);",
+      "grader": { "type": "exact", "answers": ["7"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-03",
+      "category": "arithmetic",
+      "prompt": "What is the remainder when 157 is divided by 12?",
+      "grader": { "type": "exact", "answers": ["1"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-02",
+      "category": "instruction",
+      "prompt": "How many lowercase r letters are in 'strawberry'? Reply with a digit.",
+      "grader": { "type": "exact", "answers": ["3"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "logic-03",
+      "category": "logic",
+      "prompt": "Given P implies Q, Q implies R, and P is true: can R be false? yes/no",
+      "grader": { "type": "exact", "answers": ["no"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-03",
+      "category": "code",
+      "prompt": "Python output? print(sum(i*i for i in range(4)))",
+      "grader": { "type": "exact", "answers": ["14"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-04",
+      "category": "arithmetic",
+      "prompt": "Solve 3x+7=46. Reply with x only.",
+      "grader": { "type": "exact", "answers": ["13"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-03",
+      "category": "instruction",
+      "prompt": "Sort kiwi, fig, pear alphabetically and join with |.",
+      "grader": { "type": "exact", "answers": ["fig|kiwi|pear"] },
+      "max_tokens": 12
+    },
+    {
+      "id": "logic-04",
+      "category": "logic",
+      "prompt": "Order tasks A-E: B after A; C before A; D after B; E before C. Return the unique order without spaces.",
+      "grader": { "type": "exact", "answers": ["ECABD"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-04",
+      "category": "code",
+      "prompt": "Python output? print('abcdef'[1:5:2])",
+      "grader": { "type": "exact", "answers": ["bd"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-05",
+      "category": "arithmetic",
+      "prompt": "Compute floor((2^10+31)/7).",
+      "grader": { "type": "exact", "answers": ["150"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "struct-02",
+      "category": "structured",
+      "prompt": "Return JSON for id '09' and active false, with keys id and active.",
+      "grader": { "type": "json", "value": { "id": "09", "active": false } },
+      "max_tokens": 16
+    },
+    {
+      "id": "logic-05",
+      "category": "logic",
+      "prompt": "If today is Wednesday, what weekday is 10 days later?",
+      "grader": { "type": "exact", "answers": ["Saturday"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-04",
+      "category": "instruction",
+      "prompt": "Rotate MANGO left by 2 characters.",
+      "grader": { "type": "exact", "answers": ["NGOMA"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-05",
+      "category": "code",
+      "prompt": "C output? int x=5; printf(\"%d\", x++ + 2);",
+      "grader": { "type": "exact", "answers": ["7"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-06",
+      "category": "arithmetic",
+      "prompt": "Greatest common divisor of 84 and 126?",
+      "grader": { "type": "exact", "answers": ["42"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "logic-06",
+      "category": "logic",
+      "prompt": "Exactly one of A,B,C is true. A says B is false. B says C is true. Which is true?",
+      "grader": { "type": "exact", "answers": ["A"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-05",
+      "category": "instruction",
+      "prompt": "Remove a,e,i,o,u from 'cooperation'.",
+      "grader": { "type": "exact", "answers": ["cprtn"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "code-06",
+      "category": "code",
+      "prompt": "Python output? d={i:i%2 for i in range(4)}; print(sum(d.values()))",
+      "grader": { "type": "exact", "answers": ["2"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-07",
+      "category": "arithmetic",
+      "prompt": "Convert binary 110101 to decimal.",
+      "grader": { "type": "exact", "answers": ["53"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "logic-07",
+      "category": "logic",
+      "prompt": "A clock reads 3:15. What is the smaller angle in degrees?",
+      "grader": { "type": "exact", "answers": ["7.5", "7.5°"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "struct-03",
+      "category": "structured",
+      "prompt": "Return JSON object: key b is array [2,1], key a is true.",
+      "grader": { "type": "json", "value": { "b": [2, 1], "a": true } },
+      "max_tokens": 16
+    },
+    {
+      "id": "code-07",
+      "category": "code",
+      "prompt": "Python: x=0; for i=1..4, add odd i and subtract even i. Final x?",
+      "grader": { "type": "exact", "answers": ["-2"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "arith-08",
+      "category": "arithmetic",
+      "prompt": "Least positive n with n mod 5 = 2 and n mod 3 = 1?",
+      "grader": { "type": "exact", "answers": ["7"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "follow-06",
+      "category": "instruction",
+      "prompt": "Starting at 8, apply left to right: +3, then *2, then -5.",
+      "grader": { "type": "exact", "answers": ["17"] },
+      "max_tokens": 8
+    },
+    {
+      "id": "logic-08",
+      "category": "logic",
+      "prompt": "Exactly two of A,B,C are selected. A is not selected. Return selected letters alphabetically, comma-separated.",
+      "grader": { "type": "exact", "answers": ["B,C"] },
+      "max_tokens": 8
+    }
+  ]
+}

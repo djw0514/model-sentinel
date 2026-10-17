@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-sentinel"
+version = "0.2.0"
+description = "Token-efficient regression detector for OpenAI-compatible language models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Model Sentinel contributors" }]
+dependencies = []
+
+[project.scripts]
+model-sentinel = "model_sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["model_sentinel*"]
+
+[tool.setuptools.package-data]
+model_sentinel = ["packs/*.json"]

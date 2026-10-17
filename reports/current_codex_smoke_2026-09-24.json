@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-24T00:42:00+08:00",
+  "mode": "codex_cli_batch_smoke",
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "xhigh",
+  "pack": {
+    "name": "core-reasoning-smoke",
+    "version": "1.0.0",
+    "digest": "62812f42bb44c66f2efcfc403bfd43d555eb26a2790a1dc0085247009489808c"
+  },
+  "summary": {
+    "passed": 12,
+    "failed": 0,
+    "total": 12,
+    "score": 1.0,
+    "verdict": "smoke_pass"
+  },
+  "usage": {
+    "requests": 2,
+    "input_tokens": 28142,
+    "cached_input_tokens": 3712,
+    "output_tokens": 220,
+    "reasoning_output_tokens": 133
+  },
+  "transport": {
+    "websocket_timed_out": true,
+    "https_fallback_succeeded": true
+  },
+  "results": [
+    { "id": "arith-01", "output": "489", "passed": true },
+    { "id": "logic-01", "output": "no", "passed": true },
+    { "id": "code-01", "output": "3", "passed": true },
+    { "id": "follow-01", "output": "PAES", "passed": true },
+    { "id": "arith-02", "output": "49", "passed": true },
+    { "id": "struct-01", "output": { "x": 7, "y": "blue" }, "passed": true },
+    { "id": "logic-02", "output": "Nia", "passed": true },
+    { "id": "code-02", "output": "7", "passed": true },
+    { "id": "arith-03", "output": "1", "passed": true },
+    { "id": "follow-02", "output": "3", "passed": true },
+    { "id": "logic-03", "output": "no", "passed": true },
+    { "id": "code-03", "output": "14", "passed": true }
+  ],
+  "limitations": [
+    "Eleven probes were batched into one Codex turn to avoid repeating the large agent context.",
+    "This is an absolute smoke test, not an SPRT regression verdict.",
+    "No historical baseline for the same model and settings was available.",
+    "Codex product calls and direct API calls are different evaluation surfaces."
+  ]
+}
