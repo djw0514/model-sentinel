@@ -41,6 +41,8 @@ class SequentialTest:
     samples: int = 0
     regressions: int = 0
     llr: float = 0.0
+    _stable_allowed: bool = field(default=True, init=False, repr=False)
+    _terminal_decision: str | None = field(default=None, init=False, repr=False)
 
     @property
     def upper_bound(self) -> float:
@@ -50,9 +52,16 @@ class SequentialTest:
     def lower_bound(self) -> float:
         return math.log(self.config.beta) - math.log1p(-self.config.alpha)
 
-    def add(self, regressed: bool) -> str:
+    def add(self, regressed: bool, *, allow_stable: bool = True) -> str:
+        """Add evidence; defer stable when the caller's quality checks fail.
+
+        Deferral never suppresses a regression or the sample cap. Once any
+        terminal decision is reached, later calls cannot reopen the test.
+        """
         if type(regressed) is not bool:
             raise ValueError("regressed must be a boolean")
+        if type(allow_stable) is not bool:
+            raise ValueError("allow_stable must be a boolean")
         if self.decision() != "running":
             raise ValueError("cannot add observations after the sequential test has stopped")
         self.samples += 1
@@ -61,14 +70,25 @@ class SequentialTest:
             self.llr += math.log(self.config.p1) - math.log(self.config.p0)
         else:
             self.llr += math.log1p(-self.config.p1) - math.log1p(-self.config.p0)
-        return self.decision()
+        self._stable_allowed = allow_stable
+        decision = self._current_decision(allow_stable=allow_stable)
+        if decision != "running":
+            self._terminal_decision = decision
+        return decision
 
     def decision(self) -> str:
+        return self._terminal_decision or self._current_decision(allow_stable=self._stable_allowed)
+
+    def statistical_decision(self) -> str:
+        """Classify the current evidence without the caller's stability gate."""
+        return self._current_decision(allow_stable=True)
+
+    def _current_decision(self, *, allow_stable: bool) -> str:
         if self.samples < self.config.min_samples:
             return "running"
         if self.llr >= self.upper_bound:
             return "regressed"
-        if self.llr <= self.lower_bound:
+        if allow_stable and self.llr <= self.lower_bound:
             return "stable"
         if self.samples >= self.config.max_samples:
             return "inconclusive"
@@ -77,6 +97,7 @@ class SequentialTest:
     def snapshot(self) -> dict[str, float | int | str]:
         return {
             "decision": self.decision(),
+            "statistical_decision": self.statistical_decision(),
             "samples": self.samples,
             "confirmed_regressions": self.regressions,
             "llr": round(self.llr, 6),
@@ -93,11 +114,21 @@ class SequentialTest:
 
 def _binomial_tail(n: int, p: float, start: int, stop: int) -> float:
     """Sum an inclusive binomial tail in log space, without optional dependencies."""
+    if start > stop:
+        return 0.0
+    if start == 0 and stop == n:
+        return 1.0
+    if start == stop == 0:
+        return math.exp(n * math.log1p(-p))
+    if start == stop == n:
+        return math.exp(n * math.log(p))
     log_factorial = math.lgamma(n + 1)
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
     terms = (
         math.exp(
             log_factorial - math.lgamma(k + 1) - math.lgamma(n - k + 1)
-            + k * math.log(p) + (n - k) * math.log1p(-p)
+            + k * log_p + (n - k) * log_q
         )
         for k in range(start, stop + 1)
     )

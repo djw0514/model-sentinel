@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-sentinel"
-version = "0.2.0"
+version = "0.2.1"
 description = "Token-efficient regression detector for OpenAI-compatible language models"
 readme = "README.md"
 requires-python = ">=3.10"

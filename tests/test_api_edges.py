@@ -1,5 +1,6 @@
 import io
 import json
+import ssl
 import threading
 import unittest
 import urllib.error
@@ -140,9 +141,24 @@ class APIValidationTests(unittest.TestCase):
                 with patch.object(c, "_open", return_value=raw) as opened, self.assertRaises(APIError) as raised:
                     c.complete("x", 8)
                 self.assertEqual(raised.exception.kind, "protocol_error")
-                self.assertTrue(raised.exception.unknown_usage)
+                expected_usage = response_data()["usage"] if isinstance(data, dict) and data.get("usage") == response_data()["usage"] else {}
+                self.assertEqual(raised.exception.usage, expected_usage)
+                self.assertEqual(raised.exception.unknown_usage, not bool(expected_usage))
                 self.assertEqual(opened.call_count, 1)
                 self.assertEqual(len(raised.exception.http_attempts), 1)
+
+    def test_known_usage_survives_invalid_choices_and_metadata(self):
+        for data in [response_data(choices=[]), response_data(id=42)]:
+            with self.subTest(data=data):
+                c = client()
+                with patch.object(c, "_open", return_value=response(data)), self.assertRaises(APIError) as raised:
+                    c.complete("x", 8)
+                error = raised.exception
+                self.assertEqual(error.kind, "protocol_error")
+                self.assertEqual(error.usage, data["usage"])
+                self.assertEqual(error.http_attempts[0]["usage"], data["usage"])
+                self.assertFalse(error.unknown_usage)
+                self.assertEqual(c.budget_snapshot()["unknown_usage_requests"], 0)
 
     def test_invalid_encoding_json_and_oversize_are_bounded(self):
         for raw in [b"\xff", b"not json", b"x" * 65]:
@@ -214,6 +230,135 @@ class APIRetryAndBudgetTests(unittest.TestCase):
                 self.assertEqual(opened.call_count, 1)
                 sleep.assert_not_called()
 
+    def test_excessive_retry_after_on_final_attempt_blocks_later_probes(self):
+        for retries in [0, 1]:
+            with self.subTest(retries=retries):
+                c = client(retries=retries)
+                responses = ([http_error(500)] if retries else []) + [http_error(429, retry_after="120")]
+                with patch.object(c, "_open", side_effect=responses) as opened, patch("model_sentinel.api.time.sleep") as sleep:
+                    with self.assertRaises(APIError) as raised:
+                        c.complete("x", 8)
+                    self.assertEqual(raised.exception.kind, "retry_deferred")
+                    self.assertTrue(raised.exception.fatal)
+                    self.assertEqual(len(raised.exception.http_attempts), retries + 1)
+                    with self.assertRaises(APIError) as later:
+                        c.complete("next probe", 8)
+                    self.assertEqual(later.exception.kind, "retry_deferred")
+                    self.assertEqual(later.exception.http_attempts, [])
+                    self.assertEqual(opened.call_count, retries + 1)
+                    self.assertEqual(sleep.call_count, retries)
+
+    def test_final_attempt_cooldown_applies_to_next_probe_once(self):
+        clock = FakeClock()
+        with patch("model_sentinel.api.time.monotonic", side_effect=clock.monotonic), patch("model_sentinel.api.time.sleep", side_effect=clock.sleep):
+            c = client(retries=0)
+            with patch.object(c, "_open", side_effect=[http_error(429, retry_after="3"), response()]) as opened:
+                with self.assertRaises(APIError) as raised:
+                    c.complete("x", 8)
+                self.assertEqual(raised.exception.kind, "http_error")
+                result = c.complete("next probe", 8)
+            self.assertEqual(clock.sleeps, [3.0])
+            self.assertEqual(opened.call_count, 2)
+            self.assertEqual(result.latency_ms, 3000)
+            self.assertEqual(result.http_attempts[0]["request_index"], 2)
+
+    def test_retry_after_is_measured_from_headers_not_error_body_completion(self):
+        clock = FakeClock()
+        class SlowErrorBody(io.BytesIO):
+            def read1(self, size):
+                chunk = super().read1(size)
+                if chunk:
+                    clock.now += 2
+                return chunk
+        error = urllib.error.HTTPError("https://example.invalid", 429, "busy", {"Retry-After": "3"}, SlowErrorBody(b"busy"))
+        with patch("model_sentinel.api.time.monotonic", side_effect=clock.monotonic), patch("model_sentinel.api.time.sleep", side_effect=clock.sleep), patch("model_sentinel.api.random.uniform", return_value=0.4):
+            c = client(retries=1)
+            with patch.object(c, "_open", side_effect=[error, response()]):
+                result = c.complete("x", 8)
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertEqual(result.latency_ms, 3000)
+
+    def test_shared_cooldown_blocks_concurrent_probes_without_holding_lock(self):
+        clock = FakeClock()
+        waiting = threading.Event()
+        release = threading.Event()
+        sleeper_lock = threading.Lock()
+        sleeps = []
+        def sleep(delay):
+            with sleeper_lock:
+                sleeps.append(delay)
+                if len(sleeps) == 2:
+                    waiting.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("test did not release cooldown waiters")
+        with patch("model_sentinel.api.time.monotonic", side_effect=clock.monotonic), patch("model_sentinel.api.time.sleep", side_effect=sleep):
+            c = client(retries=0)
+            with patch.object(c, "_open", side_effect=[http_error(429, retry_after="5"), response(), response()]) as opened:
+                with self.assertRaises(APIError):
+                    c.complete("x", 8)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(c.complete, "later probe", 8) for _ in range(2)]
+                    try:
+                        self.assertTrue(waiting.wait(timeout=3), "both workers must be able to wait concurrently")
+                        self.assertEqual(opened.call_count, 1)
+                        self.assertEqual(c.budget_snapshot()["http_requests"], 1)
+                        clock.now += 5
+                    finally:
+                        release.set()
+                    results = [future.result(timeout=3) for future in futures]
+            self.assertEqual(sleeps, [5.0, 5.0])
+            self.assertEqual([result.text for result in results], ["42", "42"])
+            self.assertEqual(c.budget_snapshot()["http_requests"], 3)
+
+    def test_next_probe_checks_request_budget_before_waiting_for_cooldown(self):
+        c = client(retries=0, max_requests=1)
+        with patch.object(c, "_open", side_effect=http_error(429, retry_after="3")) as opened, patch("model_sentinel.api.time.sleep") as sleep:
+            with self.assertRaises(APIError):
+                c.complete("x", 8)
+            with self.assertRaises(APIError) as raised:
+                c.complete("next probe", 8)
+        self.assertEqual(raised.exception.kind, "budget_exhausted")
+        self.assertEqual(raised.exception.http_attempts, [])
+        self.assertEqual(opened.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_final_attempt_checks_retry_after_against_deadline(self):
+        clock = FakeClock()
+        with patch("model_sentinel.api.time.monotonic", side_effect=clock.monotonic), patch("model_sentinel.api.time.sleep") as sleep:
+            c = client(retries=0, deadline=2)
+            with patch.object(c, "_open", side_effect=http_error(429, retry_after="3")) as opened, self.assertRaises(APIError) as raised:
+                c.complete("x", 8)
+            self.assertEqual(raised.exception.kind, "budget_exhausted")
+            self.assertTrue(raised.exception.fatal)
+            self.assertEqual(opened.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_error_without_retry_after_does_not_block_later_probe(self):
+        c = client(retries=0)
+        with patch.object(c, "_open", side_effect=[TimeoutError("timeout"), response()]) as opened, patch("model_sentinel.api.time.sleep") as sleep:
+            with self.assertRaises(APIError) as raised:
+                c.complete("x", 8)
+            self.assertFalse(raised.exception.fatal)
+            self.assertEqual(c.complete("next probe", 8).text, "42")
+            self.assertEqual(opened.call_count, 2)
+            sleep.assert_not_called()
+
+    def test_certificate_verification_failure_is_fatal_without_unknown_usage(self):
+        certificate = ssl.SSLCertVerificationError(1, "certificate verification failed")
+        for error in [certificate, urllib.error.URLError(certificate)]:
+            with self.subTest(error=error):
+                c = client(retries=2)
+                with patch.object(c, "_open", side_effect=error) as opened, patch("model_sentinel.api.time.sleep") as sleep:
+                    with self.assertRaises(APIError) as raised:
+                        c.complete("x", 8)
+                self.assertEqual(raised.exception.kind, "tls_error")
+                self.assertTrue(raised.exception.fatal)
+                self.assertFalse(raised.exception.unknown_usage)
+                self.assertEqual(raised.exception.usage, {})
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(c.budget_snapshot()["unknown_usage_requests"], 0)
+                sleep.assert_not_called()
+
     def test_fatal_errors_do_not_retry_and_redact_credentials(self):
         for code in [400, 401, 403, 404, 422]:
             with self.subTest(code=code):
@@ -233,6 +378,17 @@ class APIRetryAndBudgetTests(unittest.TestCase):
         self.assertTrue(result.unknown_usage)
         self.assertTrue(result.http_attempts[0]["unknown_usage"])
         self.assertFalse(result.http_attempts[1]["unknown_usage"])
+        self.assertEqual(c.budget_snapshot()["unknown_usage_requests"], 1)
+
+    def test_known_error_usage_is_preserved_alongside_an_unknown_retry(self):
+        data = response_data(id=42)
+        c = client(retries=1)
+        with patch.object(c, "_open", side_effect=[TimeoutError("timeout"), response(data)]), patch("model_sentinel.api.time.sleep"):
+            with self.assertRaises(APIError) as raised:
+                c.complete("x", 8)
+        self.assertEqual(raised.exception.usage, data["usage"])
+        self.assertTrue(raised.exception.unknown_usage)
+        self.assertEqual([a["unknown_usage"] for a in raised.exception.http_attempts], [True, False])
         self.assertEqual(c.budget_snapshot()["unknown_usage_requests"], 1)
 
     def test_request_budget_includes_retries_without_extra_sleep(self):
@@ -301,6 +457,26 @@ class APIRetryAndBudgetTests(unittest.TestCase):
             self.assertEqual(raised.exception.kind, "budget_exhausted")
             self.assertTrue(raised.exception.unknown_usage)
             self.assertEqual(len(raised.exception.http_attempts), 1)
+
+    def test_deadline_after_parsing_keeps_known_usage(self):
+        clock = FakeClock()
+        data = response_data()
+        with patch("model_sentinel.api.time.monotonic", side_effect=clock.monotonic):
+            c = client(deadline=1)
+            parse = c._parse_response
+            def slow_parse(raw):
+                result = parse(raw)
+                clock.now += 2
+                return result
+            with patch.object(c, "_open", return_value=response(data)), patch.object(c, "_parse_response", side_effect=slow_parse):
+                with self.assertRaises(APIError) as raised:
+                    c.complete("x", 8)
+            self.assertEqual(raised.exception.kind, "budget_exhausted")
+            self.assertTrue(raised.exception.fatal)
+            self.assertEqual(raised.exception.usage, data["usage"])
+            self.assertEqual(raised.exception.http_attempts[0]["usage"], data["usage"])
+            self.assertFalse(raised.exception.unknown_usage)
+            self.assertEqual(c.budget_snapshot()["unknown_usage_requests"], 0)
 
 
 class APIRedirectTests(unittest.TestCase):

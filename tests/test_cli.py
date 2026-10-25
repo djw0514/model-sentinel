@@ -115,6 +115,77 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 call.assert_not_called()
 
+    def test_unusable_output_fails_before_requests(self):
+        for output in ("", Path(self.temp.name), self.baseline_path / "output.json"):
+            with self.subTest(output=output):
+                client = LocalClient(self.pack)
+                self.assertEqual(self.invoke(["run", "--output", str(output)], client), 1)
+                self.assertEqual(client.calls, 0)
+
+    def test_output_preflight_permission_failure_preserves_previous_report(self):
+        self.output_path.write_text("previous report", encoding="utf-8")
+        client = LocalClient(self.pack)
+        with patch("model_sentinel.cli.tempfile.TemporaryFile", side_effect=PermissionError("denied")):
+            self.assertEqual(self.invoke(self.check_args(), client), 1)
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(self.output_path.read_text(encoding="utf-8"), "previous report")
+
+    def test_outputs_cannot_overwrite_packs_or_comparison_inputs(self):
+        pack_path = Path(self.temp.name) / "pack.json"
+        pack_path.write_text(json.dumps(self.pack), encoding="utf-8")
+        candidate_path = Path(self.temp.name) / "candidate.json"
+        candidate_path.write_bytes(self.baseline_path.read_bytes())
+        cases = [
+            (["run", "--pack", str(pack_path), "--output", str(pack_path)], pack_path),
+            (["check", "--baseline", str(self.baseline_path), "--output", str(self.baseline_path)], self.baseline_path),
+            (["compare", str(self.baseline_path), str(candidate_path), "--output", str(candidate_path)], candidate_path),
+            (["compare", str(self.baseline_path), str(candidate_path), "--output", str(self.baseline_path)], self.baseline_path),
+        ]
+        for args, source in cases:
+            with self.subTest(command=args[0], output=source):
+                previous = source.read_bytes()
+                client = LocalClient(self.pack)
+                self.assertEqual(self.invoke(args, client), 1)
+                self.assertEqual(client.calls, 0)
+                self.assertEqual(source.read_bytes(), previous)
+
+    def test_output_hardlink_to_baseline_is_rejected(self):
+        alias = Path(self.temp.name) / "alias.json"
+        try:
+            os.link(self.baseline_path, alias)
+        except OSError as exc:
+            self.skipTest(f"hardlinks unavailable: {exc}")
+        previous = self.baseline_path.read_bytes()
+        client = LocalClient(self.pack)
+        self.assertEqual(self.invoke(self.check_args() + ["--output", str(alias)], client), 1)
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(self.baseline_path.read_bytes(), previous)
+        self.assertTrue(alias.samefile(self.baseline_path))
+
+    def test_existing_output_can_be_replaced_and_parent_can_be_created(self):
+        for output in (self.output_path, Path(self.temp.name) / "new" / "report.json"):
+            with self.subTest(output=output):
+                if output.parent.exists():
+                    output.write_text("previous report", encoding="utf-8")
+                client = LocalClient(self.pack)
+                self.assertEqual(self.invoke(["run", "--limit", "1", "--output", str(output)], client), 0)
+                self.assertEqual(client.calls, 1)
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["summary"]["total"], 1)
+                self.assertEqual(list(output.parent.glob(".*.tmp")), [])
+
+    def test_calibration_output_cannot_overwrite_manifest_pack_or_reports(self):
+        manifest = Path(self.temp.name) / "labels.json"
+        pack_path = Path(self.temp.name) / "pack.json"
+        pack_path.write_text(json.dumps(self.pack), encoding="utf-8")
+        manifest.write_text(json.dumps({"pack": "pack.json", "cases": [{
+            "baseline": "baseline.json", "candidate": "baseline.json", "expected": "stable",
+        }]}), encoding="utf-8")
+        for source in (manifest, pack_path, self.baseline_path):
+            with self.subTest(source=source):
+                previous = source.read_bytes()
+                self.assertEqual(self.invoke(["calibrate", str(manifest), "--output", str(source)]), 1)
+                self.assertEqual(source.read_bytes(), previous)
+
     def test_explicit_api_key_variable_takes_precedence(self):
         parser = build_parser()
         args = parser.parse_args(["run", "--model", "test-model", "--output", "unused.json",

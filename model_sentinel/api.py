@@ -7,6 +7,7 @@ import http.client
 import json
 import math
 import random
+import ssl
 import threading
 import time
 import urllib.error
@@ -29,7 +30,7 @@ class APIError(RuntimeError):
     def __init__(
         self, message: str, *, kind: str = "api_error", fatal: bool = False,
         http_attempts: list[dict[str, Any]] | None = None, latency_ms: int = 0,
-        unknown_usage: bool = False,
+        unknown_usage: bool = False, usage: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -37,6 +38,7 @@ class APIError(RuntimeError):
         self.http_attempts = list(http_attempts or [])
         self.latency_ms = latency_ms
         self.unknown_usage = unknown_usage
+        self.usage = dict(usage or {})
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,26 @@ def _usage(value: Any, depth: int = 0) -> dict[str, Any]:
     return result
 
 
+def _total_usage(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum known HTTP usage once; nested details remain separate counters."""
+    totals: dict[str, Any] = {}
+
+    def merge(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, dict):
+                existing = target.setdefault(key, {})
+                if isinstance(existing, dict):
+                    merge(existing, value)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                existing = target.setdefault(key, 0)
+                if isinstance(existing, int):
+                    target[key] += value
+
+    for attempt in attempts:
+        merge(totals, attempt["usage"])
+    return totals
+
+
 def _finite_number(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -203,6 +225,8 @@ class ChatCompletionsClient:
         self._lock = threading.Lock()
         self._http_requests = 0
         self._unknown_usage_requests = 0
+        self._not_before = 0.0
+        self._retry_deferred = False
 
     def configuration(self) -> dict[str, Any]:
         return {
@@ -241,10 +265,15 @@ class ChatCompletionsClient:
         return self.timeout if remaining is None else min(self.timeout, remaining)
 
     def _reserve_request(self) -> tuple[int, float]:
-        with self._lock:
-            timeout = self._check_budget()
-            self._http_requests += 1
-            return self._http_requests, timeout
+        while True:
+            with self._lock:
+                timeout = self._check_budget()
+                delay = self._cooldown_delay()
+                if delay <= 0:
+                    self._http_requests += 1
+                    return self._http_requests, timeout
+            # Another worker can extend the cooldown while this worker waits.
+            time.sleep(delay)
 
     def _open(self, request: urllib.request.Request, timeout: float):
         # Each request owns its handlers; workers share no mutable opener state.
@@ -292,18 +321,31 @@ class ChatCompletionsClient:
                 return None
         return max(0.0, seconds) if math.isfinite(seconds) else None
 
+    def _record_retry_after(self, delay: float | None) -> None:
+        if delay is None:
+            return
+        with self._lock:
+            self._not_before = max(self._not_before, time.monotonic() + delay)
+            if delay > MAX_RETRY_WAIT_SECONDS:
+                self._retry_deferred = True
+
+    def _cooldown_delay(self, local_delay: float = 0.0) -> float:
+        """Check shared server throttling while holding the client lock."""
+        delay = max(local_delay, self._not_before - time.monotonic(), 0.0)
+        remaining = self._remaining()
+        if remaining is not None and delay >= remaining:
+            raise APIError("retry would exceed run deadline", kind="budget_exhausted", fatal=True)
+        if self._retry_deferred:
+            raise APIError(
+                "server requested a retry wait above 60 seconds; retry deferred",
+                kind="retry_deferred", fatal=True,
+            )
+        return delay
+
     def _wait_retry(self, delay: float) -> None:
         with self._lock:
             self._check_budget()
-            remaining = self._remaining()
-            if remaining is not None and delay >= remaining:
-                raise APIError("retry would exceed run deadline", kind="budget_exhausted", fatal=True)
-            if delay > MAX_RETRY_WAIT_SECONDS:
-                # Stop instead of capping the delay and retrying before Retry-After.
-                raise APIError(
-                    "server requested a retry wait above 60 seconds; retry deferred",
-                    kind="retry_deferred", fatal=True,
-                )
+            delay = self._cooldown_delay(delay)
         time.sleep(delay)
 
     def _parse_response(self, raw: bytes) -> dict[str, Any]:
@@ -313,24 +355,29 @@ class ChatCompletionsClient:
             raise _protocol_error("response is not valid UTF-8 JSON") from exc
         if not isinstance(data, dict):
             raise _protocol_error("response root must be an object")
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise _protocol_error("response must contain a non-empty choices list of objects")
-        message = choices[0].get("message")
-        if not isinstance(message, dict):
-            raise _protocol_error("response choice.message must be an object")
-        refusal = _optional_string(message.get("refusal"), "message.refusal")
-        if "content" not in message and refusal is None:
-            raise _protocol_error("response message has neither content nor refusal")
         usage = _usage(data["usage"]) if data.get("usage") is not None else {}
-        return {
-            "text": _content_to_text(message.get("content")), "usage": usage,
-            "response_id": _optional_string(data.get("id"), "id"),
-            "finish_reason": _optional_string(choices[0].get("finish_reason"), "finish_reason"),
-            "refusal": refusal,
-            "response_model": _optional_string(data.get("model"), "model"),
-            "system_fingerprint": _optional_string(data.get("system_fingerprint"), "system_fingerprint"),
-        }
+        try:
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise _protocol_error("response must contain a non-empty choices list of objects")
+            message = choices[0].get("message")
+            if not isinstance(message, dict):
+                raise _protocol_error("response choice.message must be an object")
+            refusal = _optional_string(message.get("refusal"), "message.refusal")
+            if "content" not in message and refusal is None:
+                raise _protocol_error("response message has neither content nor refusal")
+            return {
+                "text": _content_to_text(message.get("content")), "usage": usage,
+                "response_id": _optional_string(data.get("id"), "id"),
+                "finish_reason": _optional_string(choices[0].get("finish_reason"), "finish_reason"),
+                "refusal": refusal,
+                "response_model": _optional_string(data.get("model"), "model"),
+                "system_fingerprint": _optional_string(data.get("system_fingerprint"), "system_fingerprint"),
+            }
+        except APIError as exc:
+            exc.usage = usage
+            exc.unknown_usage = not bool(usage)
+            raise
 
     def complete(self, prompt: str, max_tokens: int) -> APIResponse:
         if not isinstance(prompt, str) or not prompt.strip():
@@ -361,6 +408,7 @@ class ChatCompletionsClient:
                 self._redact(error), kind=error.kind, fatal=error.fatal,
                 http_attempts=attempts, latency_ms=self._elapsed(started),
                 unknown_usage=error.unknown_usage or any(item["unknown_usage"] for item in attempts),
+                usage=_total_usage(attempts),
             )
 
         for attempt in range(self.retries + 1):
@@ -385,6 +433,8 @@ class ChatCompletionsClient:
                 status_code = exc.code
                 retryable = exc.code in {408, 409, 425, 429} or 500 <= exc.code < 600
                 retry_after = self._retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+                if retryable:
+                    self._record_retry_after(retry_after)
                 try:
                     detail = self._read_body(exc, 2048, truncate=True).decode("utf-8", errors="replace")
                 except (APIError, OSError, http.client.HTTPException):
@@ -397,18 +447,26 @@ class ChatCompletionsClient:
                     fatal=not retryable, unknown_usage=exc.code >= 500 or exc.code == 408,
                 )
             except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-                retryable = True
-                error = APIError(self._redact(exc), kind="transport_error", unknown_usage=True)
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                certificate_error = isinstance(reason, ssl.SSLCertVerificationError)
+                retryable = not certificate_error
+                error = APIError(
+                    self._redact(exc), kind="tls_error" if certificate_error else "transport_error",
+                    fatal=certificate_error, unknown_usage=not certificate_error,
+                )
             except APIError as exc:
                 error = exc
+                if result is not None:
+                    error.usage = result["usage"]
                 result = None
                 if exc.kind == "budget_exhausted":
-                    error.unknown_usage = True
+                    error.unknown_usage = not bool(error.usage)
             if error is not None and error.kind != "budget_exhausted":
                 try:
                     self._remaining()
                 except APIError as exc:
                     exc.unknown_usage = error.unknown_usage
+                    exc.usage = error.usage
                     error = exc
                     retryable = False
             record = {
@@ -416,22 +474,32 @@ class ChatCompletionsClient:
                 "status_code": status_code, "latency_ms": self._elapsed(attempt_started),
                 "error_kind": error.kind if error else None,
                 "unknown_usage": error.unknown_usage if error else not bool(result and result["usage"]),
-                "usage": result["usage"] if result else {},
+                "usage": result["usage"] if result else error.usage,
             }
             attempts.append(record)
             if record["unknown_usage"]:
                 with self._lock:
                     self._unknown_usage_requests += 1
             if result is not None:
+                result["usage"] = _total_usage(attempts)
                 return APIResponse(
                     **result, latency_ms=self._elapsed(started), http_attempts=attempts,
                     unknown_usage=any(item["unknown_usage"] for item in attempts),
                 )
             assert error is not None
-            if error.fatal or not retryable or attempt >= self.retries:
+            if error.fatal or not retryable:
+                raise enriched(error) from None
+            try:
+                # A last-attempt 429 must still stop the run when its cooldown
+                # cannot be honored; ordinary cooldowns apply to the next probe.
+                with self._lock:
+                    self._cooldown_delay()
+            except APIError as exc:
+                raise enriched(exc) from None
+            if attempt >= self.retries:
                 raise enriched(error) from None
             backoff = min(0.5 * 2 ** min(attempt, 6), 30.0)
-            delay = max(retry_after or 0.0, random.uniform(backoff / 2, backoff))
+            delay = random.uniform(backoff / 2, backoff)
             try:
                 self._wait_retry(delay)
             except APIError as exc:

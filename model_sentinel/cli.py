@@ -6,7 +6,9 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 import sys
+import tempfile
 from typing import Any
 
 from . import __version__
@@ -23,6 +25,31 @@ VERDICT_EXIT = {"stable": 0, "regressed": 2, "inconclusive": 3}
 class SentinelParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise ValueError(message)
+
+
+def _protect_output(path: str | Path, inputs: list[str | Path]) -> None:
+    destination = Path(path).resolve()
+    for source in inputs:
+        source = Path(source).resolve()
+        if destination == source or (
+            destination.exists() and source.exists() and destination.samefile(source)
+        ):
+            raise ValueError(f"output must not overwrite an input file: {source}")
+
+
+def _prepare_output(path: str | Path, inputs: list[str | Path]) -> None:
+    """Catch unusable destinations before paid requests, without changing old output."""
+    _protect_output(path, inputs)
+    destination = Path(path)
+    if destination.exists():
+        if not destination.is_file():
+            raise ValueError(f"output must be a file: {destination}")
+        if not os.access(destination, os.W_OK):
+            raise PermissionError(f"output is not writable: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent) as probe:
+        probe.write(b"\n")
+        probe.flush()
 
 
 def _add_api_arguments(parser: argparse.ArgumentParser) -> None:
@@ -236,11 +263,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "calibrate":
+            _prepare_output(args.output, [args.manifest])
             report = calibrate_manifest(
                 args.manifest, config=_config(args), confirm_failures=not args.no_confirm,
                 replay=args.replay, allow_config_mismatch=args.allow_config_mismatch,
                 max_error_rate=args.max_error_rate,
             )
+            _protect_output(args.output, [report["pack_path"]] + [
+                item[role] for item in report["results"] for role in ("baseline", "candidate")
+            ])
             save_report(args.output, report)
             print(f"calibration: {report['total']} labeled comparisons -> {args.output}")
             print("rates:", json.dumps({key: report[key] for key in
@@ -248,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         pack = load_pack(args.pack)
+        if args.output is not None:
+            inputs = [args.pack] + [
+                value for field in ("baseline", "candidate")
+                if (value := getattr(args, field, None)) is not None
+            ]
+            _prepare_output(args.output, inputs)
         if args.command == "run":
             report = run_full(
                 pack,
@@ -329,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                 allow_config_mismatch=args.allow_config_mismatch,
                 max_error_rate=args.max_error_rate,
             )
-            if args.output:
+            if args.output is not None:
                 save_report(args.output, report)
             _print_verdict(report, args.output)
             return _exit_code(report)

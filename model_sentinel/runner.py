@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import threading
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -48,7 +49,7 @@ def _attempt(client: CompletionClient, case: dict[str, Any], max_tokens: int | N
     except APIError as exc:
         return {
             "passed": None, "status": getattr(exc, "kind", "api_error"),
-            "error": str(exc) or "API request failed", "usage": {},
+            "error": str(exc) or "API request failed", "usage": getattr(exc, "usage", {}),
             "fatal": getattr(exc, "fatal", False), "latency_ms": getattr(exc, "latency_ms", 0),
             "http_attempts": getattr(exc, "http_attempts", []),
             "unknown_usage": getattr(exc, "unknown_usage", False),
@@ -204,20 +205,30 @@ def _default_config(pack: dict[str, Any]) -> SequentialConfig:
     return SequentialConfig(min_samples=min(8, maximum), max_samples=maximum)
 
 
+def _stability_blockers(*, error_rate: float, valid_rate: float, category_coverage_met: bool, max_error_rate: float, aborted: bool) -> list[str]:
+    reasons = []
+    if aborted:
+        reasons.append("run_aborted")
+    if error_rate > max_error_rate:
+        reasons.append("error_rate_exceeded")
+    if 1 - valid_rate > max_error_rate + 1e-12:
+        reasons.append("insufficient_valid_coverage")
+    if not category_coverage_met:
+        reasons.append("insufficient_category_coverage")
+    return reasons
+
+
 def _gate_verdict(snapshot: dict[str, Any], report_coverage: dict[str, Any], report_availability: dict[str, Any], max_error_rate: float, *, aborted: bool) -> dict[str, Any]:
     verdict = dict(snapshot)
-    reasons = []
+    reasons: list[str] = []
     if verdict["decision"] == "running":
         verdict["decision"] = "inconclusive"
     if verdict["decision"] == "stable":
-        if aborted:
-            reasons.append("run_aborted")
-        if report_availability["error_rate"] > max_error_rate:
-            reasons.append("error_rate_exceeded")
-        if 1 - report_coverage["valid_rate"] > max_error_rate + 1e-12:
-            reasons.append("insufficient_valid_coverage")
-        if not report_coverage["category_coverage_met"]:
-            reasons.append("insufficient_category_coverage")
+        reasons = _stability_blockers(
+            error_rate=report_availability["error_rate"], valid_rate=report_coverage["valid_rate"],
+            category_coverage_met=report_coverage["category_coverage_met"],
+            max_error_rate=max_error_rate, aborted=aborted,
+        )
         if reasons:
             verdict["decision"] = "inconclusive"
     verdict["quality_reasons"] = reasons
@@ -249,6 +260,9 @@ def adaptive_check(
     ordered, actual_seed = sample_order(eligible, strategy=sampling, seed=sample_seed)
     test = SequentialTest(effective_config)
     results: list[dict[str, Any]] = []
+    counted_categories: Counter[str] = Counter()
+    total_attempts = 0
+    errors = 0
     for case in ([] if preflight_issues else ordered):
         if test.decision() != "running":
             break
@@ -258,14 +272,26 @@ def adaptive_check(
         item = aggregate_case(case, attempts, len(attempts))
         item.update(observation(attempts, confirm_failures))
         item["passed"] = not item["regressed"] if item["counted"] else None
-        if item["counted"]:
-            item["decision_after"] = test.add(item["regressed"])
         results.append(item)
-        if any(attempt.get("fatal") for attempt in attempts):
+        total_attempts += len(attempts)
+        errors += sum(attempt["passed"] is None for attempt in attempts)
+        fatal = any(attempt.get("fatal") for attempt in attempts)
+        if item["counted"]:
+            counted_categories[case["category"]] += 1
+            blockers = _stability_blockers(
+                error_rate=errors / total_attempts, valid_rate=(test.samples + 1) / len(results),
+                category_coverage_met=all(counted_categories[category] >= min_category_samples for category in categories),
+                max_error_rate=max_error_rate, aborted=fatal,
+            )
+            item["decision_after"] = test.add(item["regressed"], allow_stable=not blockers)
+            if blockers and test.statistical_decision() == "stable":
+                item["stable_deferred"] = blockers
+        if fatal:
             break
 
     aborted, abort_reason = _abort_details(results)
     snapshot = test.snapshot()
+    snapshot["decision"] = test.statistical_decision()
     if snapshot["decision"] == "running":
         snapshot["decision"] = "inconclusive"
     report_coverage = coverage(pack, eligible, results, offline=False, min_category_samples=min_category_samples)

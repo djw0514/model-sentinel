@@ -1,4 +1,6 @@
 import json
+from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,8 +8,8 @@ from unittest.mock import patch
 
 from model_sentinel.api import APIResponse
 from model_sentinel.calibration import calibrate_manifest
-from model_sentinel.pack import load_pack
-from model_sentinel.runner import run_full, save_report
+from model_sentinel.pack import DEFAULT_PACK, load_pack
+from model_sentinel.runner import compare_runs, load_report, run_full, save_report
 from model_sentinel.sequential import SequentialConfig
 
 
@@ -45,6 +47,7 @@ class CalibrationTests(unittest.TestCase):
         with patch("model_sentinel.calibration.compare_runs", side_effect=[{"verdict": {"decision": decision, "samples": 12}} for decision in decisions]):
             report = calibrate_manifest(self.manifest)
         self.assertEqual(report["total"], 6)
+        self.assertEqual(report["pack_path"], str(DEFAULT_PACK.resolve()))
         self.assertAlmostEqual(report["false_alarm_rate"], 1 / 3)
         self.assertAlmostEqual(report["miss_rate"], 1 / 3)
         self.assertAlmostEqual(report["inconclusive_rate"], 1 / 3)
@@ -63,6 +66,7 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["baseline"], str((self.root / "baseline.json").resolve()))
         self.assertEqual(compare.call_args.kwargs, {"config": config, "confirm_failures": False, "replay": True, "allow_config_mismatch": True, "max_error_rate": 0.1})
         self.assertEqual(report["parameters"]["p1"], 0.3)
+        self.assertEqual(report["pack_path"], str((self.root / "custom-pack.json").resolve()))
 
     def test_manifest_shape_labels_duplicate_names_and_fields_are_rejected(self):
         malformed = [
@@ -112,13 +116,90 @@ class CalibrationTests(unittest.TestCase):
             calibrate_manifest(self.manifest)
 
     def test_invalid_options_and_missing_reports_have_actionable_paths(self):
-        for options, field in (({"max_error_rate": float("nan")}, "max_error_rate"), ({"confirm_failures": 1}, "confirm_failures"), ({"config": {}}, "config")):
+        for options, field in (({"max_error_rate": float("nan")}, "max_error_rate"), ({"max_error_rate": 10**1000}, "max_error_rate"), ({"confirm_failures": 1}, "confirm_failures"), ({"config": {}}, "config")):
             with self.subTest(options=options):
                 with self.assertRaisesRegex(ValueError, f"parameters.{field}"):
                     calibrate_manifest(self.manifest, **options)
         self.write([self.case(candidate="missing.json")])
         with self.assertRaisesRegex(ValueError, r"manifest\.cases\[0\]\.candidate"):
             calibrate_manifest(self.manifest)
+
+    def test_shared_reports_and_path_aliases_are_read_once_per_call(self):
+        baseline = (self.root / "baseline.json").resolve()
+        candidate = (self.root / "candidate.json").resolve()
+        self.write([
+            self.case(name="relative"),
+            self.case(name="absolute", baseline=str(baseline), candidate=str(candidate)),
+            self.case(name="parent", baseline="child/../baseline.json", candidate="./candidate.json"),
+        ])
+        with patch("model_sentinel.calibration.load_report", wraps=load_report) as load, patch(
+            "model_sentinel.calibration.compare_runs",
+            return_value={"verdict": {"decision": "stable", "samples": 12}},
+        ) as compare:
+            report = calibrate_manifest(self.manifest)
+        self.assertEqual(Counter(call.args[0] for call in load.call_args_list), {baseline: 1, candidate: 1})
+        self.assertEqual(compare.call_count, 3)
+        self.assertEqual([item["name"] for item in report["results"]], ["relative", "absolute", "parent"])
+        self.assertEqual(report["confusion"]["stable"]["stable"], 3)
+
+    def test_report_cache_does_not_hide_changes_between_calibrations(self):
+        candidate = self.root / "candidate.json"
+        self.write([self.case(), self.case()])
+
+        def compare(pack, baseline, current, **kwargs):
+            return {"verdict": {"decision": current["decision"], "samples": 12}}
+
+        with patch("model_sentinel.calibration.load_report", wraps=load_report) as load, patch(
+            "model_sentinel.calibration.compare_runs", side_effect=compare,
+        ):
+            candidate.write_text('{"decision":"stable"}', encoding="utf-8")
+            first = calibrate_manifest(self.manifest)
+            candidate.write_text('{"decision":"regressed"}', encoding="utf-8")
+            second = calibrate_manifest(self.manifest)
+        self.assertEqual(load.call_count, 4)
+        self.assertEqual(first["confusion"]["stable"]["stable"], 2)
+        self.assertEqual(second["confusion"]["stable"]["regressed"], 2)
+
+    def test_actual_comparisons_leave_cached_reports_unchanged_including_replay(self):
+        baseline = self.root / "baseline.json"
+        pack = load_pack()
+        original = run_full(pack, CorrectClient(pack), repeats=3)
+        save_report(baseline, original)
+        self.write([self.case(candidate="./baseline.json"), self.case(candidate=str(baseline))])
+
+        for replay in (False, True):
+            with self.subTest(replay=replay):
+                observed = []
+
+                def compare(pack, old, current, **kwargs):
+                    before = deepcopy(old)
+                    self.assertIs(old, current)
+                    result = compare_runs(pack, old, current, **kwargs)
+                    self.assertEqual(old, before)
+                    self.assertEqual(current, before)
+                    observed.append(old)
+                    return result
+
+                with patch("model_sentinel.calibration.load_report", wraps=load_report) as load, patch(
+                    "model_sentinel.calibration.compare_runs", side_effect=compare,
+                ):
+                    report = calibrate_manifest(self.manifest, replay=replay)
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(len(observed), 2)
+                self.assertIs(observed[0], observed[1])
+                self.assertEqual(observed[0], original)
+                self.assertEqual(report["confusion"]["stable"]["stable"], 2)
+
+    def test_cached_reports_preserve_later_case_load_and_comparison_error_paths(self):
+        self.write([self.case(), self.case(candidate="missing.json")])
+        stable = {"verdict": {"decision": "stable", "samples": 12}}
+        with patch("model_sentinel.calibration.compare_runs", return_value=stable):
+            with self.assertRaisesRegex(ValueError, r"manifest\.cases\[1\]\.candidate"):
+                calibrate_manifest(self.manifest)
+        self.write([self.case(), self.case()])
+        with patch("model_sentinel.calibration.compare_runs", side_effect=[stable, ValueError("invalid report")]):
+            with self.assertRaisesRegex(ValueError, r"manifest\.cases\[1\]: invalid report"):
+                calibrate_manifest(self.manifest)
 
 
 if __name__ == "__main__":

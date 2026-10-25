@@ -8,6 +8,7 @@ from dataclasses import replace
 from model_sentinel.api import APIError, APIResponse
 from model_sentinel.pack import load_pack
 from model_sentinel.runner import adaptive_check, compare_runs, run_full, validate_baseline
+from model_sentinel.sampling import sample_order
 from model_sentinel.sequential import SequentialConfig
 
 
@@ -149,6 +150,77 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["summary"]["errors"], 20)
         self.assertEqual(report["availability"]["status"], "degraded")
         self.assertEqual(report["coverage"]["counted"], 12)
+
+    def test_check_continues_to_fill_a_recoverable_category_gap(self):
+        order, _ = sample_order(self.pack["cases"], seed=0)
+        overrides = {case["prompt"]: [APIError("temporary")] for case in order[:10] if case["category"] == "structured"}
+        client = FakeClient(self.pack, overrides)
+        report = adaptive_check(self.pack, self.baseline, client, sample_seed=0)
+        self.assertEqual(report["verdict"]["decision"], "stable")
+        self.assertEqual(client.calls, 15)
+        self.assertEqual(report["verdict"]["samples"], 13)
+        self.assertEqual(report["results"][-2]["stable_deferred"], ["insufficient_category_coverage"])
+        self.assertEqual(report["results"][-2]["decision_after"], "running")
+        self.assertTrue(report["coverage"]["category_coverage_met"])
+
+    def test_check_continues_until_error_and_valid_rates_recover(self):
+        overrides = {case["prompt"]: [APIError("temporary")] for case in self.pack["cases"][:4]}
+        client = FakeClient(self.pack, overrides)
+        report = adaptive_check(self.pack, self.baseline, client, sampling="ordered")
+        self.assertEqual(report["verdict"]["decision"], "stable")
+        self.assertEqual(client.calls, 20)
+        self.assertEqual(report["verdict"]["samples"], 16)
+        self.assertEqual(report["availability"]["error_rate"], 0.2)
+        self.assertEqual(report["coverage"]["valid_rate"], 0.8)
+        self.assertEqual(report["results"][15]["stable_deferred"], ["error_rate_exceeded", "insufficient_valid_coverage"])
+
+    def test_supplemental_failures_can_turn_deferred_stability_into_regression(self):
+        order, _ = sample_order(self.pack["cases"], seed=0)
+        overrides = {case["prompt"]: [APIError("temporary")] for case in order[:10] if case["category"] == "structured"}
+        overrides.update({case["prompt"]: ["wrong", "wrong"] for case in order[14:17]})
+        client = FakeClient(self.pack, overrides)
+        report = adaptive_check(self.pack, self.baseline, client, sample_seed=0)
+        self.assertEqual(report["verdict"]["decision"], "regressed")
+        self.assertEqual(report["capability_verdict"]["decision"], "regressed")
+        self.assertEqual(report["verdict"]["confirmed_regressions"], 3)
+        self.assertEqual(report["verdict"]["samples"], 15)
+        self.assertEqual(client.calls, 20)
+
+    def test_deferred_stability_still_stops_at_sample_cap(self):
+        order, _ = sample_order(self.pack["cases"], seed=0)
+        overrides = {case["prompt"]: [APIError("temporary")] for case in order[:10] if case["category"] == "structured"}
+        client = FakeClient(self.pack, overrides)
+        report = adaptive_check(self.pack, self.baseline, client, sample_seed=0, config=SequentialConfig(max_samples=12))
+        self.assertEqual(client.calls, 14)
+        self.assertEqual(report["verdict"]["decision"], "inconclusive")
+        self.assertEqual(report["capability_verdict"]["decision"], "stable")
+        self.assertEqual(report["results"][-1]["decision_after"], "inconclusive")
+        self.assertEqual(report["verdict"]["quality_reasons"], ["insufficient_category_coverage"])
+
+    def test_fatal_error_while_filling_coverage_preserves_statistical_evidence(self):
+        order, _ = sample_order(self.pack["cases"], seed=0)
+        overrides = {case["prompt"]: [APIError("temporary")] for case in order[:10] if case["category"] == "structured"}
+        overrides[order[14]["prompt"]] = [APIError("request budget exhausted", kind="budget_exhausted", fatal=True)]
+        client = FakeClient(self.pack, overrides)
+        report = adaptive_check(self.pack, self.baseline, client, sample_seed=0)
+        self.assertEqual(client.calls, 15)
+        self.assertTrue(report["aborted"])
+        self.assertEqual(report["verdict"]["decision"], "inconclusive")
+        self.assertEqual(report["capability_verdict"]["decision"], "stable")
+        self.assertIn("run_aborted", report["verdict"]["quality_reasons"])
+        self.assertEqual(report["verdict"]["samples"], 12)
+
+    def test_known_usage_on_api_error_is_counted_once(self):
+        error = APIError(
+            "invalid response", http_attempts=[{"usage": {"total_tokens": 7}}],
+            usage={"total_tokens": 7, "completion_tokens_details": {"reasoning_tokens": 3}},
+        )
+        case = self.pack["cases"][0]
+        report = run_full(self.pack, FakeClient(self.pack, {case["prompt"]: [error]}), limit=2)
+        self.assertEqual(report["summary"]["errors"], 1)
+        self.assertEqual(report["usage"]["total_tokens"], 18)
+        self.assertEqual(report["usage"]["completion_tokens_details"]["reasoning_tokens"], 3)
+        validate_baseline(self.pack, report)
 
     def test_unreachable_category_coverage_returns_inconclusive(self):
         overrides = {case["prompt"]: ["wrong"] for case in self.pack["cases"] if case["category"] == "structured"}

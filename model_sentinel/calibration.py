@@ -6,6 +6,7 @@ guarantee. Calibration never calls a model or changes decision thresholds.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timezone
 import math
@@ -14,7 +15,7 @@ import re
 from typing import Any
 
 from .grading import strict_json_loads
-from .pack import load_pack, pack_digest
+from .pack import DEFAULT_PACK, load_pack, pack_digest
 from .reports import SCHEMA_VERSION
 from .runner import compare_runs, load_report
 from .sequential import SequentialConfig
@@ -57,7 +58,7 @@ def calibrate_manifest(
             raise ValueError(f"parameters.{key} must be a boolean")
     if config is not None and not isinstance(config, SequentialConfig):
         raise ValueError("parameters.config must be a SequentialConfig")
-    if type(max_error_rate) not in (int, float) or not math.isfinite(max_error_rate) or not 0 <= max_error_rate < 1:
+    if type(max_error_rate) not in (int, float) or not 0 <= max_error_rate < 1 or not math.isfinite(max_error_rate):
         raise ValueError("parameters.max_error_rate must be finite and in [0, 1)")
 
     manifest_path = _local_path(path, None, "manifest")
@@ -91,7 +92,7 @@ def calibrate_manifest(
             "candidate": _local_path(entry.get("candidate"), manifest_path.parent, f"{location}.candidate"),
         })
 
-    pack_path = _local_path(manifest["pack"], manifest_path.parent, "manifest.pack") if "pack" in manifest else None
+    pack_path = _local_path(manifest["pack"], manifest_path.parent, "manifest.pack") if "pack" in manifest else DEFAULT_PACK.resolve()
     pack = load_pack(pack_path)
     if config is None:
         maximum = min(32, len(pack["cases"]))
@@ -105,11 +106,23 @@ def calibrate_manifest(
         for expected in ("stable", "regressed")
     }
     results: list[dict[str, Any]] = []
+    # Resolved Path keys deduplicate relative, absolute, and symlink aliases.
+    # Keep this cache local so another calibration always reads current files.
+    report_cache: dict[Path, dict[str, Any]] = {}
+    remaining_uses = Counter(entry[role] for entry in resolved for role in ("baseline", "candidate"))
     for entry in resolved:
         reports = {}
         for role in ("baseline", "candidate"):
             try:
-                reports[role] = load_report(entry[role])
+                report_path = entry[role]
+                if report_path not in report_cache:
+                    report_cache[report_path] = load_report(report_path)
+                # compare_runs treats reports as read-only, so repeated cases
+                # can reuse parsed data without copying every nested attempt.
+                reports[role] = report_cache[report_path]
+                remaining_uses[report_path] -= 1
+                if remaining_uses[report_path] == 0:
+                    del report_cache[report_path]
             except (OSError, ValueError) as exc:
                 raise ValueError(f"{entry['location']}.{role}: {exc}") from exc
         try:
@@ -136,6 +149,7 @@ def calibrate_manifest(
         "schema_version": SCHEMA_VERSION, "mode": "calibration",
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "manifest": str(manifest_path),
+        "pack_path": str(pack_path),
         "pack": {"name": pack["name"], "version": pack["version"], "digest": pack_digest(pack)},
         "parameters": parameters, "total": len(results),
         "false_alarm_rate": confusion["stable"]["regressed"] / healthy if healthy else None,
